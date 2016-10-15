@@ -1,0 +1,238 @@
+#!/bin/bash
+
+# ========================================================================================================================
+#
+#  File Name      : dsssci
+#
+#  Author         : GFI  - subcontracted by AIRBUS
+#
+#  Platform       : Unix / Linux
+#
+#  Version:
+#       1.0.5     2015/04/22   JFA   - Adding time log
+#       1.0.4     2015/04/20   JFA   - Translating n characters to n characters instead of 1 to 1
+#                                    - WLCHARBAD and WLCHARREP are now arrays
+#       1.0.3     2015/04/14   GRO   - Dealing with "\" in files name
+#                              JFA   - Add "\" in WLCHARBAD with "_" in WLCHARREP
+#       1.0.2     2015/04/10   PCE   - User SED/Y to translate characters
+#                                    - Rename to [dsssci]
+#       1.0.1     2015/04/09   PCE   - Script & initialization file renaming
+#                                    - Add heading block & comments
+#                                    - Make world callable
+#                                    - Clean code
+#       1.0.0     2015/04/02   JFA   - First version
+#
+#  Description    : Script to submit and execute a batch-job(s) via LSF for application
+#
+# ========================================================================================================================
+
+WDIR=$(cd "$(dirname "$0")";pwd)
+WVER="1.0"
+
+# --- Initialization
+
+. ${WDIR}/dsssci.ini
+WLCHARGOODESCAPED=$(echo "${WLCHARGOOD}" | sed -e 's:\\:\\\\:' -e 's:\$:\\$:' -e 's:\.:\\.:' -e 's:\*:\\*:' -e 's:\/:\\/:' -e 's:\^:\\^:' -e 's:\-:\\-:' -e 's:\!:\\!:')
+WTMPFIC=/tmp/dsssci_$$
+rm -f ${WTMPFIC}_*.*
+
+export LANG=en_US.UTF-8
+
+# --- Loglnging functions
+
+Log()
+{
+        printf "%s" "$*"
+}
+
+Logln()
+{
+        printf "%s\n" "$*"
+}
+
+LogError()
+{
+        Logln "[ERROR] $*"
+}
+
+ExitOnError()
+{
+        LogError "$*"
+        Logln
+
+        [[ -f ${WTMPFIC}_idx.err ]] && cat ${WTMPFIC}_idx.err
+        [[ -f ${WTMPFIC}_bad.err ]] && cat ${WTMPFIC}_bad.err
+        rm -f ${WTMPFIC}_*.*
+
+        exit 1
+}
+
+# --- Print usage
+
+usage()
+{
+        Logln 'Usage: dsssci {{-l|--list}|{-r|--replace}} <root directory>'
+        Logln
+        Logln '-l or --list     List files whose name contain an illegal character.'
+        Logln '                  Please provide a path.'
+        Logln '-r or --replace   Replace illegal characters in files name.'
+        Logln '                  Please provide a path.'
+        Logln
+}
+
+# --- List translatable objects in a reverse list (Must treat childs before parents)
+
+searchbads()
+{
+        Logln 'Index root directory.'
+        Log 'Find --- START ' && date +%r
+        find "${WDROOT}" -print 1>${WTMPFIC}_idx.dat 2>${WTMPFIC}_idx.err
+        Log 'Find --- STOP ' && date +%r
+        [[ $? != 0 ]] && ExitOnError "Cannot index root directory."
+        Logln "Root directory contains $(wc -l ${WTMPFIC}_idx.dat | sed 's/[[:space:]].*//') objects."
+
+        Log 'Search for eligible ojects : '
+        rm -f "${WTMPFIC}_bad.tmp"
+        let i=0
+        Logln
+        Log 'Search --- START ' && date +%r
+        cat "${WTMPFIC}_idx.dat" | while read -r wo
+        do
+                let i=i+1
+                [[ $i -eq 100 ]] && printf '.' && let i=0
+
+                won=$(basename "${wo}")
+
+                [[ ${won} = *[^${WLCHARGOODESCAPED}]* ]] && echo "${wo}" >> "${WTMPFIC}_bad.tmp"
+        done
+        Logln
+        Log 'Search --- STOP ' && date +%r
+        Logln
+        Logln 'Finish.'
+        Log 'Sort --- START ' && date +%r
+        Logln 'Sort and analyze eligible objects.'
+        (
+                sort -r "${WTMPFIC}_bad.tmp" | while read -r wo
+                do
+                        if   [[ -f "${wo}" ]]; then
+                        echo "F ${wo}"
+                        elif [[ -d "${wo}" ]]; then
+                        echo "D ${wo}"
+                        elif [[ -L "${wo}" ]]; then
+                        echo "L ${wo}"
+                        else
+                        echo "X ${wo}"
+                        fi
+                done
+        ) 1>"${WTMPFIC}_bad.dat" 2>"${WTMPFIC}_bad.err"
+        [[ $? != 0 ]] && ExitOnError "Problem while processing index."
+        Log 'Sort --- STOP ' && date +%r
+        Logln 'Finish.'
+}
+
+# --- Rename bad objects with normalized name
+
+renamebads()
+{
+
+        rm -f "${WTMPFIC}_untouched.dat"
+        Log 'Rename --- START ' && date +%r
+        Logln
+        cat "${WTMPFIC}_bad.dat" | while read -r wt wo
+        do
+                if [[ ${wt} = [FDL] ]]
+                then
+                        wod=$(dirname  "${wo}")
+                        won=$(basename "${wo}")
+                        wonn=$won
+
+                        for char in "${!WLCHARBAD[@]}"
+                        do
+                                if [[ "${WLCHARBAD[$char]}" == "\\" ]]
+                                then
+                                        WLCHARBAD[$char]=$(echo ${WLCHARBAD[$char]} | sed -e 's:\\:\\\\:')
+                                fi
+
+                                if grep -q "${WLCHARBAD[$char]}" <<< "$wonn"
+                                then
+                                        wonn=$(echo "$wonn" | sed "s:${WLCHARBAD[$char]}:${WLCHARREP[$char]}:g")
+                                fi
+
+                        done
+
+                       wonn=$(echo "$wonn" | sed "s:[^${WLCHARGOODESCAPED}]:${WCHARDEFAULT}:g")
+
+                        Logln "Rename in [${wod}] object [${won}] to [${wonn}]."
+                        if [[ -e "${wod}/${wonn}" ]]
+                        then
+                                LogError 'New object name already exists.'
+                        else
+                                mv "${wod}/${won}" "${wod}/${wonn}"
+                                [[ $? -ne 0 ]] && LogError 'Error while renaming.'
+                        fi
+                        Logln
+                else
+                        LogError "Cannot treat [${wo}], not supported type."
+                        echo "${wt} ${wo}" >> "${WTMPFIC}_untouched.dat"
+                fi
+        done
+        Log 'Rename --- STOP ' && date +%r
+}
+
+# --- Treat command line options
+
+[[ $# -lt 1 ]] && usage && ExitOnError "Bad call syntax."
+
+WMODE=list
+case $1 in
+        -l|--list)
+                WMODE=list
+                shift
+                ;;
+        -r|--replace)
+                WMODE=replace
+                shift
+                ;;
+        -h)
+                usage
+                exit 0
+                ;;
+        *)
+                usage
+                ExitOnError "Bad call syntax."
+                ;;
+esac
+
+[[ $# -ne 1 ]] && usage && ExitOnError "No root directory given."
+
+export WDROOT=$1
+[[ ! -d "$1" ]] && ExitOnError "Invalid or inaccessible root directory [${WDROOT}]."
+
+# -- Do the job
+
+Logln "Treat [${WDROOT}]."
+Log 'DSSSCI --- START ' && date +%r
+dateStart=$(date "+%s")
+searchbads
+
+case ${WMODE} in
+        list)
+                Log 'Eligible objects : ' && cat "${WTMPFIC}_bad.dat" | wc -l
+                Logln
+                cat "${WTMPFIC}_bad.dat"
+                ;;
+        replace)
+                Logln 'Processing to objects renaming.'
+                Logln
+                renamebads
+                ;;
+esac
+
+Log 'DSSSCI --- STOP ' && date +%r
+dateStop=$(date "+%s")
+diffDate=$(($dateStop-$dateStart))
+Logln "$(($diffDate / 60)) minutes and $(($diffDate % 60)) seconds elapsed."
+
+rm -f ${WTMPFIC}_*.*
+exit 0
+
